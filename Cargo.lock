@@ -1263,7 +1263,6 @@ dependencies = [
 [[package]]
 name = "craft-cloud"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=289d562cc6e8b567819aee51f759a78f41a65454#289d562cc6e8b567819aee51f759a78f41a65454"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -1321,7 +1320,6 @@ dependencies = [
 [[package]]
 name = "craft-ui"
 version = "0.1.0"
-source = "git+https://github.com/storytold/craft-libs?rev=289d562cc6e8b567819aee51f759a78f41a65454#289d562cc6e8b567819aee51f759a78f41a65454"
 dependencies = [
  "craft-cloud",
  "egui",

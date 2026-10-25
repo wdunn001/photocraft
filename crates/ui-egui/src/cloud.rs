@@ -358,6 +358,18 @@ impl CloudApp for PhotocraftApp {
         Some(self.tr("A name with no extension is saved as a PhotoCraft document (.pcraft)."))
     }
 
+    fn recents(&self) -> Vec<String> {
+        self.ui.recent_files.clone()
+    }
+
+    fn open_recent(&mut self, path: &str) {
+        let _ = self.run("file.open", json!({"path": path}));
+    }
+
+    fn browse_local(&mut self) {
+        let _ = self.run("file.open", json!({}));
+    }
+
     fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {
         let t = Tokens::get(ui.ctx());
         craft_ui::cloud::CloudStyle {
@@ -465,18 +477,8 @@ pub(crate) fn menu(app: &mut PhotocraftApp, id: &str, params: &Json) -> Option<R
 
 // ---------------------------------------------------------------- where the pages sit
 
-/// The Home screen's Cloud section: the user's own cloud files on one side and what other people
-/// shared with them on the other, each with a menu holding Open, Share and Work together.
-///
-/// Drawn by `craft_ui::cloud`, so every Craft app offers the same page. Returns whether anything
-/// was drawn: a build with no cloud service configured draws nothing.
+/// The Home screen's File Open chrome: Recent, Cloud, Shared with me, and This computer.
 pub fn home_section(app: &mut PhotocraftApp, ui: &mut Ui) -> bool {
-    if !available(app) {
-        return false;
-    }
-    let t = Tokens::get(ui.ctx());
-    ui.label(egui::RichText::new(crate::i18n::t("Cloud")).font(crate::theme::semibold(12.5)).color(t.text_dim));
-    ui.add_space(6.0);
     open_page(app, ui);
     true
 }

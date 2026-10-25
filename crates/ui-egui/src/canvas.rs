@@ -3183,11 +3183,10 @@ fn start_screen(app: &mut PhotocraftApp, ui: &mut egui::Ui) {
     let recent: Vec<String> =
         if cfg!(target_arch = "wasm32") || !show_recent { Vec::new() } else { app.ui.recent_files.iter().take(HOME_RECENT).cloned().collect() };
     let recent_h = if recent.is_empty() { 0.0 } else { 34.0 + recent.len() as f32 * HOME_RECENT_ROW };
-    // A tiling window manager can give the canvas less room than the card wants: shrink the card
-    // to fit, and stack the buttons when they don't fit side by side. The Cloud section is two
-    // lists side by side, so a build with a service wants extra height below Recent.
-    let cloud = crate::cloud::available(app);
-    let cloud_h = if cloud { 360.0 } else { 0.0 };
+    // PlacesPanel is File › Open on every Craft app, so Home always has room
+    // for it (Recent, Cloud, This computer), not only when a service is linked.
+    let cloud = true;
+    let cloud_h = 360.0;
     let new_label = crate::shortcuts::command_label(app, "New document…", "file.new");
     let open_label = crate::shortcuts::command_label(app, "Open…", "file.open");
     let card_width = HOME_CARD_WIDTH.min(area.width());
