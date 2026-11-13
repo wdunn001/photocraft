@@ -205,15 +205,17 @@ impl<'a> Cursor<'a> {
 
     /// A STRING: `n+1` then `n` bytes and a NUL (0 for the empty string).
     fn string(&mut self) -> Result<String> {
+        Ok(String::from_utf8_lossy(self.string_bytes()?).into_owned())
+    }
+
+    /// The same bounded STRING read without allocating or decoding an unused field.
+    fn string_bytes(&mut self) -> Result<&'a [u8]> {
         let n = self.u32()? as usize;
-        if n == 0 {
-            return Ok(String::new());
-        }
         if n > MAX_STRING {
             return Err(invalid(format!("a string of {n} bytes exceeds the limit")));
         }
         let s = self.take(n)?;
-        Ok(String::from_utf8_lossy(s.strip_suffix(&[0]).unwrap_or(s)).into_owned())
+        Ok(s.strip_suffix(&[0]).unwrap_or(s))
     }
 
     fn skip(&mut self, n: usize) -> Result<()> {
@@ -227,8 +229,8 @@ struct Prop<'a> {
     data: &'a [u8],
 }
 
-/// Reads a property list; `fixed` gives the native payload sizes the spec says GIMP trusts over
-/// the length word. Ends at PROP_END (type 0) or at the end of the file.
+/// Reads a property list, measuring known payloads whose length words GIMP writes incorrectly.
+/// Ends at PROP_END (type 0).
 fn props<'a>(c: &mut Cursor<'a>) -> Result<Vec<Prop<'a>>> {
     let mut out = Vec::new();
     loop {
@@ -239,12 +241,14 @@ fn props<'a>(c: &mut Cursor<'a>) -> Result<Vec<Prop<'a>>> {
         }
         // PROP_COLORMAP's length word was wrong in some releases (n+4 for 3n+4 bytes); its real
         // size follows from the count. PROP_USER_UNIT's length is wrong in every release.
+        // PROP_LINK_LAYER's length can be four bytes short (#8857); read all its fields.
         let len = match kind {
             1 => {
                 let n = c.at(c.pos).u32()? as usize;
                 4usize.checked_add(n.checked_mul(3).ok_or_else(|| invalid("colormap overflow"))?).ok_or_else(|| invalid("colormap overflow"))?
             }
             24 => user_unit_len(c)?,
+            48 => link_layer_len(c)?,
             _ => len,
         };
         if len > MAX_PAYLOAD {
@@ -256,6 +260,16 @@ fn props<'a>(c: &mut Cursor<'a>) -> Result<Vec<Prop<'a>>> {
             return Err(invalid("too many properties"));
         }
     }
+}
+
+/// A PROP_LINK_LAYER payload: flags, a path STRING, then the source width and height.
+/// The dimensions are present for raster links too, where their values are unused.
+fn link_layer_len(c: &Cursor<'_>) -> Result<usize> {
+    let mut p = c.at(c.pos);
+    p.skip(4)?;
+    p.string_bytes()?;
+    p.skip(8)?;
+    Ok(p.pos - c.pos)
 }
 
 /// The real size of a PROP_USER_UNIT payload: a float, a count and three (XCF 21+) or five
@@ -567,61 +581,42 @@ fn label(tag: u32) -> LabelColor {
     }
 }
 
-/// Writes `px` (its channels matching `surface`'s) at `x, y` of the document.
-fn write_pixels(surface: &mut Surface, px: &Pixels, x: i32, y: i32) -> Result<()> {
+/// Writes `px` (its channels matching `surface`'s) at `x, y` of the document, charging the
+/// tiles that creates to `budget`: the drawable was admitted by its logical samples, and a
+/// narrow drawable (or one referenced by many layer pointers) stores far more in whole tiles.
+fn write_pixels(surface: &mut Surface, px: &Pixels, x: i32, y: i32, budget: &mut usize) -> Result<()> {
     let (w, h) = (px.width as i32, px.height as i32);
     let rect = Rect::new(x, y, x.checked_add(w).ok_or_else(|| invalid("offset overflow"))?, y.checked_add(h).ok_or_else(|| invalid("offset overflow"))?);
     if surface.channels() != px.channels || px.data.len() != (px.width as usize) * (px.height as usize) * px.channels {
         return Err(invalid("pixel data does not match the drawable"));
     }
+    // Checked before the write (it allocates the whole rect's tiles); only the tiles kept after
+    // `prune()` are charged.
+    let tiles = usize::try_from(photocraft_raster::tile_storage_bytes(rect, &surface.format())).unwrap_or(usize::MAX);
+    if tiles > *budget {
+        return Err(invalid("the layers exceed the 1 GiB pixel limit"));
+    }
+    let before = surface.tile_count();
     surface.write_region(rect, &px.data);
     surface.prune();
+    let added = surface.tile_count().saturating_sub(before) as u64;
+    *budget = budget.saturating_sub(usize::try_from(photocraft_raster::stored_tiles_bytes(added, &surface.format())).unwrap_or(usize::MAX));
     Ok(())
 }
 
-/// Imports an XCF file (already inflated when it was gzipped).
-pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<ImportResult> {
-    if !is_xcf(bytes) {
-        return Err(invalid("not an XCF file"));
-    }
-    let mut c = Cursor { b: bytes, pos: MAGIC.len(), wide: false };
-    let tag = c.take(5)?;
-    let version = match tag {
-        b"file\0" => 0,
-        [b'v', a, b, d, 0] if a.is_ascii_digit() && b.is_ascii_digit() && d.is_ascii_digit() => {
-            u32::from(a - b'0') * 100 + u32::from(b - b'0') * 10 + u32::from(d - b'0')
-        }
-        _ => return Err(invalid("unknown XCF version tag")),
-    };
-    c.wide = version >= 11;
-    let mut warnings = Warnings::default();
-    if version > KNOWN_VERSION {
-        warnings.note(&format!("XCF version {version} is newer than this reader (version {KNOWN_VERSION}); unknown parts were skipped"));
-    }
-    let (w, h, base_type) = (c.u32()?, c.u32()?, c.u32()?);
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(invalid(format!("canvas {w}x{h} must be 1 to {MAX_SIDE} pixels a side")));
-    }
-    if (w as usize).saturating_mul(h as usize).saturating_mul(16) > MAX_PIXEL_BYTES {
-        return Err(invalid("the canvas exceeds the 1 GiB pixel limit"));
-    }
-    let precision = if version >= 4 { Precision::from_header(version, c.u32()?)? } else { Precision::GAMMA8 };
-    let mode = match base_type {
-        0 => ColorMode::Rgb,
-        1 => ColorMode::Grayscale,
-        2 => ColorMode::Rgb,
-        t => return Err(invalid(format!("unknown image type {t}"))),
-    };
-    let depth = precision.depth();
-    if base_type == 2 {
-        warnings.note("the indexed image opens as RGB");
-    }
-    if !precision.float && precision.bytes == 4 {
-        warnings.note("32-bit integer samples open as 16-bit");
-    }
+struct ImageMetadata {
+    compression: Compression,
+    colormap: Vec<[u8; 3]>,
+    resolution: Option<(f32, f32)>,
+    guides: Vec<(i32, u8)>,
+    icc: Option<Vec<u8>>,
+    comment: Option<String>,
+    path_count: usize,
+}
 
+fn read_image_metadata(c: &mut Cursor<'_>) -> Result<ImageMetadata> {
     // Image properties.
-    let image_props = props(&mut c)?;
+    let image_props = props(c)?;
     let mut compression = Compression::None;
     let mut colormap = Vec::new();
     let mut resolution = None;
@@ -668,6 +663,52 @@ pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<Im
             _ => {}
         }
     }
+
+    Ok(ImageMetadata { compression, colormap, resolution, guides, icc, comment, path_count })
+}
+
+/// Imports an XCF file (already inflated when it was gzipped).
+pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<ImportResult> {
+    if !is_xcf(bytes) {
+        return Err(invalid("not an XCF file"));
+    }
+    let mut c = Cursor { b: bytes, pos: MAGIC.len(), wide: false };
+    let tag = c.take(5)?;
+    let version = match tag {
+        b"file\0" => 0,
+        [b'v', a, b, d, 0] if a.is_ascii_digit() && b.is_ascii_digit() && d.is_ascii_digit() => {
+            u32::from(a - b'0') * 100 + u32::from(b - b'0') * 10 + u32::from(d - b'0')
+        }
+        _ => return Err(invalid("unknown XCF version tag")),
+    };
+    c.wide = version >= 11;
+    let mut warnings = Warnings::default();
+    if version > KNOWN_VERSION {
+        warnings.note(&format!("XCF version {version} is newer than this reader (version {KNOWN_VERSION}); unknown parts were skipped"));
+    }
+    let (w, h, base_type) = (c.u32()?, c.u32()?, c.u32()?);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(invalid(format!("canvas {w}x{h} must be 1 to {MAX_SIDE} pixels a side")));
+    }
+    if (w as usize).saturating_mul(h as usize).saturating_mul(16) > MAX_PIXEL_BYTES {
+        return Err(invalid("the canvas exceeds the 1 GiB pixel limit"));
+    }
+    let precision = if version >= 4 { Precision::from_header(version, c.u32()?)? } else { Precision::GAMMA8 };
+    let mode = match base_type {
+        0 => ColorMode::Rgb,
+        1 => ColorMode::Grayscale,
+        2 => ColorMode::Rgb,
+        t => return Err(invalid(format!("unknown image type {t}"))),
+    };
+    let depth = precision.depth();
+    if base_type == 2 {
+        warnings.note("the indexed image opens as RGB");
+    }
+    if !precision.float && precision.bytes == 4 {
+        warnings.note("32-bit integer samples open as 16-bit");
+    }
+
+    let ImageMetadata { compression, colormap, resolution, guides, icc, comment, mut path_count } = read_image_metadata(&mut c)?;
 
     let mut layer_ptrs = Vec::new();
     loop {
@@ -750,7 +791,7 @@ pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<Im
         ctl.check().map_err(|_| IoError::Cancelled)?;
         let (name, cprops, px) = image.channel(ptr, ctl)?;
         let mut surface = Surface::new(mask_fmt);
-        write_pixels(&mut surface, &px, 0, 0)?;
+        write_pixels(&mut surface, &px, 0, 0, &mut image.budget)?;
         if cprops.iter().any(|p| p.kind == 4) {
             selection = Some(surface);
         } else {
@@ -800,6 +841,12 @@ pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<Im
     if path_count > 0 {
         image.warnings.note(&format!("{path_count} path(s) were not imported"));
     }
+    add_document_warnings(&mut image, &document, precision, linear_compositing);
+    ctl.progress(1.0);
+    Ok(ImportResult { document, warnings: image.warnings.finish(), source_read_only: true, preview_only: false })
+}
+
+fn add_document_warnings(image: &mut Image<'_>, document: &Document, precision: Precision, linear_compositing: bool) {
     // GIMP clips a layer in any mode but Normal to the layers beneath it, so it shows nothing where
     // they are transparent; PhotoCraft (like Photoshop) shows it there. Only tell when there is
     // transparency to show through: a bottom layer that is not opaque.
@@ -818,8 +865,6 @@ pub(crate) fn import(name: &str, bytes: &[u8], ctl: &Interrupt<'_>) -> Result<Im
     if document.layers.is_empty() {
         image.warnings.note("the XCF file has no layers");
     }
-    ctl.progress(1.0);
-    Ok(ImportResult { document, warnings: image.warnings.finish(), source_read_only: true, preview_only: false })
 }
 
 /// Puts `node` where its item path says, under the groups already placed; a path that leads
@@ -1035,7 +1080,7 @@ impl<'a> Image<'a> {
                 px = Pixels { width: px.width, height: px.height, channels: n + 1, data };
             }
             let mut surface = Surface::new(fmt);
-            write_pixels(&mut surface, &px, x, y)?;
+            write_pixels(&mut surface, &px, x, y, &mut self.budget)?;
             layer.content = LayerContent::Raster(surface);
             if !alpha {
                 layer.locks.transparency = true;
@@ -1044,7 +1089,7 @@ impl<'a> Image<'a> {
         if mptr != 0 {
             let (_mname, _mprops, px) = self.channel(mptr, ctl)?;
             let mut surface = Surface::new(mask_fmt);
-            write_pixels(&mut surface, &px, x, y)?;
+            write_pixels(&mut surface, &px, x, y, &mut self.budget)?;
             layer.mask = Some(LayerMask { surface, enabled: apply_mask, linked: true, density: 1.0, feather: 0.0 });
         }
         let linear = composite_space.unsigned_abs() == 1 || blend_space.unsigned_abs() == 1;
