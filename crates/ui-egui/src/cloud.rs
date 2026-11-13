@@ -358,18 +358,6 @@ impl CloudApp for PhotocraftApp {
         Some(self.tr("A name with no extension is saved as a PhotoCraft document (.pcraft)."))
     }
 
-    fn recents(&self) -> Vec<String> {
-        self.ui.recent_files.clone()
-    }
-
-    fn open_recent(&mut self, path: &str) {
-        let _ = self.run("file.open", json!({"path": path}));
-    }
-
-    fn browse_local(&mut self) {
-        let _ = self.run("file.open", json!({}));
-    }
-
     fn style(&self, ui: &Ui) -> craft_ui::cloud::CloudStyle {
         let t = Tokens::get(ui.ctx());
         craft_ui::cloud::CloudStyle {
